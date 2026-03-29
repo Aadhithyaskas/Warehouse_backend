@@ -1,0 +1,3 @@
+EMAIL_HOST_USER = 'ganuu1121@gmail.com'
+EMAIL_HOST_PASSWORD = 'jzbk opmk rabh ivax' 
+hii hello how are you
