@@ -742,9 +742,8 @@ class GetInventoryView(APIView):
         serializer = InventorySerializer(inventory)
         return Response(serializer.data)
 
-
 class UpdateInventoryView(APIView):
-    """Update inventory details"""
+    """Update inventory safely (restricted)"""
 
     def put(self, request, inventory_id):
         if not request.user.is_authenticated:
@@ -752,21 +751,24 @@ class UpdateInventoryView(APIView):
 
         inventory = get_object_or_404(Inventory, inventory_id=inventory_id)
 
-        # Prevent negative quantity
-        new_quantity = request.data.get("quantity")
-        if new_quantity is not None:
-            try:
-                qty = int(new_quantity)
-                if qty < 0:
-                    return Response({"error": "Quantity cannot be negative"}, status=400)
-            except (TypeError, ValueError):
-                return Response({"error": "Invalid quantity value"}, status=400)
+        qty = request.data.get("quantity")
 
-        serializer = InventorySerializer(inventory, data=request.data, partial=True)
-        if serializer.is_valid():
-            serializer.save()
-            return Response({"message": "Inventory updated successfully"})
-        return Response(serializer.errors, status=400)
+        if qty is not None:
+            try:
+                qty = int(qty)
+                if qty < 0:
+                    raise ValueError
+            except:
+                return Response({"error": "Invalid quantity"}, status=400)
+
+            # capacity check
+            if qty > inventory.bin.capacity:
+                return Response({"error": "Exceeds bin capacity"}, status=400)
+
+            inventory.quantity = qty
+            inventory.save()
+
+        return Response({"message": "Inventory updated"})
 
 
 class DeleteInventoryView(APIView):
@@ -839,35 +841,38 @@ class StockMovementByProductView(APIView):
             "data": data
         })
 
-
 class CreateInventoryView(APIView):
-    """Create new inventory record"""
+    """Create inventory safely"""
 
     def post(self, request):
         if not request.user.is_authenticated:
             return Response({"error": "Authentication required"}, status=401)
 
-        # Validate required fields
-        if not request.data.get("product"):
-            return Response({"error": "product is required"}, status=400)
-        if not request.data.get("bin"):
-            return Response({"error": "bin is required"}, status=400)
+        product_id = request.data.get("product")
+        bin_id = request.data.get("bin")
 
-        serializer = InventorySerializer(data=request.data)
+        if not product_id or not bin_id:
+            return Response({"error": "product and bin required"}, status=400)
 
-        if serializer.is_valid():
-            inventory = serializer.save()
-            return Response({
-                "message": "Inventory created",
-                "inventory_id": inventory.inventory_id,
-                "data": serializer.data
-            }, status=201)
+        product = get_object_or_404(Product, product_id=product_id)
+        bin_obj = get_object_or_404(Bin, bin_id=bin_id)
 
-        return Response(serializer.errors, status=400)
+        if Inventory.objects.filter(product=product, bin=bin_obj).exists():
+            return Response({"error": "Inventory already exists"}, status=400)
 
+        inventory = Inventory.objects.create(
+            product=product,
+            bin=bin_obj,
+            quantity=request.data.get("quantity", 0)
+        )
+
+        return Response({
+            "message": "Inventory created",
+            "inventory_id": inventory.inventory_id
+        }, status=201)
 
 class AddStockByProductView(APIView):
-    """Add stock to existing inventory"""
+    """Add stock using bin allocation (multi-bin supported)"""
 
     def post(self, request, product_id):
         if not request.user.is_authenticated:
@@ -875,54 +880,65 @@ class AddStockByProductView(APIView):
 
         try:
             qty = int(request.data.get("quantity"))
-        except (TypeError, ValueError):
-            return Response({"error": "quantity must be a valid integer"}, status=400)
+            if qty <= 0:
+                raise ValueError
+        except:
+            return Response({"error": "Valid quantity required"}, status=400)
 
-        if qty <= 0:
-            return Response({"error": "quantity must be greater than zero"}, status=400)
+        product = get_object_or_404(Product, product_id=product_id)
 
-        try:
-            product = Product.objects.get(product_id=product_id)
-        except Product.DoesNotExist:
-            return Response({"error": "Product not found"}, status=404)
-
-        # Find inventory record for this product
-        inventory = Inventory.objects.filter(product=product).first()
-
-        if not inventory:
-            return Response({
-                "error": "Inventory not found for this product. Create inventory first."
-            }, status=404)
+        remaining = qty
+        updates = []
 
         with transaction.atomic():
-            previous_qty = inventory.quantity
-            inventory.quantity += qty
-            inventory.save()
+            while remaining > 0:
+                bin_obj = assign_bin(product, remaining)
 
-            # Track movement
-            StockMovement.objects.create(
-                product=product,
-                bin=inventory.bin,
-                movement_type="STOCK_ADDITION",
-                quantity=qty,
-                previous_stock=previous_qty,
-                new_stock=inventory.quantity
-            )
+                if not bin_obj:
+                    return Response({"error": "No bin available"}, status=400)
 
-        # Check reorder level
+                available = bin_obj.capacity - bin_obj.current_load
+                put_qty = min(remaining, available)
+
+                inventory, _ = Inventory.objects.get_or_create(
+                    product=product,
+                    bin=bin_obj,
+                    defaults={"quantity": 0}
+                )
+
+                prev = inventory.quantity
+                inventory.quantity += put_qty
+                inventory.save()
+
+                # update bin
+                bin_obj.current_load += put_qty
+                bin_obj.save()
+
+                StockMovement.objects.create(
+                    product=product,
+                    bin=bin_obj,
+                    movement_type="STOCK_ADDITION",
+                    quantity=put_qty,
+                    previous_stock=prev,
+                    new_stock=inventory.quantity
+                )
+
+                updates.append({
+                    "bin": bin_obj.bin_id,
+                    "added": put_qty
+                })
+
+                remaining -= put_qty
+
         check_reorder(product)
 
         return Response({
-            "message": "Stock added successfully",
-            "product_id": product_id,
-            "inventory_id": inventory.inventory_id,
-            "added_quantity": qty,
-            "current_quantity": inventory.quantity
+            "message": "Stock added",
+            "total_added": qty,
+            "distribution": updates
         })
-
-
 class RemoveStockByProductView(APIView):
-    """Remove stock from inventory"""
+    """Remove stock using optimized picking"""
 
     def post(self, request, product_id):
         if not request.user.is_authenticated:
@@ -930,89 +946,76 @@ class RemoveStockByProductView(APIView):
 
         try:
             qty = int(request.data.get("quantity"))
-        except (TypeError, ValueError):
-            return Response({"error": "quantity must be a valid integer"}, status=400)
+            if qty <= 0:
+                raise ValueError
+        except:
+            return Response({"error": "Valid quantity required"}, status=400)
 
-        if qty <= 0:
-            return Response({"error": "quantity must be greater than zero"}, status=400)
+        product = get_object_or_404(Product, product_id=product_id)
 
-        try:
-            product = Product.objects.get(product_id=product_id)
-        except Product.DoesNotExist:
-            return Response({"error": "Product not found"}, status=404)
-
-        inventories = Inventory.objects.filter(product=product, quantity__gt=0)
+        inventories = Inventory.objects.select_related("bin").filter(
+            product=product,
+            quantity__gt=0
+        )
 
         if not inventories.exists():
-            return Response({"error": "No stock available for this product"}, status=404)
+            return Response({"error": "No stock available"}, status=404)
 
-        total_available = inventories.aggregate(total=Sum("quantity"))["total"] or 0
+        total = sum(i.quantity for i in inventories)
+        if qty > total:
+            return Response({"error": "Insufficient stock"}, status=400)
 
-        if qty > total_available:
-            return Response({
-                "error": f"Requested quantity ({qty}) exceeds available stock ({total_available})"
-            }, status=400)
+        # Optimize picking
+        inventories = sorted(
+            inventories,
+            key=lambda x: (
+                x.bin.distance_from_dispatch,
+                x.bin.pick_count
+            )
+        )
 
         remaining = qty
-        removed_from_bins = []
+        result = []
 
         with transaction.atomic():
             for inv in inventories:
                 if remaining <= 0:
                     break
 
-                if inv.quantity >= remaining:
-                    previous_qty = inv.quantity
-                    inv.quantity -= remaining
+                pick = min(inv.quantity, remaining)
+                prev = inv.quantity
 
-                    removed_from_bins.append({
-                        "bin_id": inv.bin.bin_id,
-                        "removed_quantity": remaining,
-                        "previous_quantity": previous_qty,
-                        "new_quantity": inv.quantity
-                    })
+                inv.quantity -= pick
+                inv.save()
 
-                    StockMovement.objects.create(
-                        product=product,
-                        bin=inv.bin,
-                        movement_type="STOCK_REMOVAL",
-                        quantity=remaining,
-                        previous_stock=previous_qty,
-                        new_stock=inv.quantity
-                    )
+                bin_obj = inv.bin
+                bin_obj.current_load -= pick
+                bin_obj.pick_count += 1
+                bin_obj.last_picked_at = timezone.now()
+                bin_obj.save()
 
-                    inv.save()
-                    remaining = 0
-                else:
-                    previous_qty = inv.quantity
-                    removed_from_bins.append({
-                        "bin_id": inv.bin.bin_id,
-                        "removed_quantity": inv.quantity,
-                        "previous_quantity": previous_qty,
-                        "new_quantity": 0
-                    })
+                StockMovement.objects.create(
+                    product=product,
+                    bin=bin_obj,
+                    movement_type="STOCK_REMOVAL",
+                    quantity=pick,
+                    previous_stock=prev,
+                    new_stock=inv.quantity
+                )
 
-                    StockMovement.objects.create(
-                        product=product,
-                        bin=inv.bin,
-                        movement_type="STOCK_REMOVAL",
-                        quantity=inv.quantity,
-                        previous_stock=previous_qty,
-                        new_stock=0
-                    )
+                result.append({
+                    "bin": bin_obj.bin_id,
+                    "removed": pick
+                })
 
-                    remaining -= inv.quantity
-                    inv.quantity = 0
-                    inv.save()
+                remaining -= pick
 
-        # Check reorder level
         check_reorder(product)
 
         return Response({
-            "message": "Stock removed successfully",
-            "product_id": product_id,
-            "removed_quantity": qty,
-            "removed_from_bins": removed_from_bins
+            "message": "Stock removed",
+            "total_removed": qty,
+            "distribution": result
         })
 
 

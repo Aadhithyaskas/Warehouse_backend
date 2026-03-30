@@ -7,6 +7,8 @@ from .models import (
 )
 from products.models import Product
 from vendors.models import Vendor
+from django.db.models import Sum
+from django.utils import timezone
 
 
 # ================= BIN SERIALIZERS =================
@@ -55,64 +57,76 @@ class BinSerializer(serializers.ModelSerializer):
 # ================= INVENTORY SERIALIZERS =================
 
 class InventorySerializer(serializers.ModelSerializer):
-    """Serializer for Inventory model with nested details"""
-    
+    """Serializer for Inventory model with validations"""
+
     product_name = serializers.CharField(source='product.product_name', read_only=True)
     product_sku = serializers.CharField(source='product.sku', read_only=True)
     bin_location = serializers.CharField(source='bin.bin_id', read_only=True)
     zone_type = serializers.CharField(source='bin.shelf.rack.zone.zone_type', read_only=True)
     available_space = serializers.SerializerMethodField()
-    
+
     class Meta:
         model = Inventory
         fields = [
-            'inventory_id', 'product', 'product_name', 'product_sku',
-            'bin', 'bin_location', 'zone_type', 'quantity', 
-            'available_space', 'created_at', 'updated_at'
+            'inventory_id',
+            'product',
+            'product_name',
+            'product_sku',
+            'bin',
+            'bin_location',
+            'zone_type',
+            'quantity',
+            'available_space',
+            'created_at',
+            'updated_at'
         ]
         read_only_fields = ['inventory_id', 'created_at', 'updated_at']
-    
+
+    # ---------- Helpers ----------
+
     def get_available_space(self, obj):
         if obj.bin:
-            return obj.bin.capacity - obj.bin.current_load
+            return max(obj.bin.capacity - obj.bin.current_load, 0)
         return None
-    
+
+    # ---------- Validations ----------
+
     def validate_quantity(self, value):
         if value < 0:
             raise serializers.ValidationError("Quantity cannot be negative")
         return value
-    
+
     def validate(self, data):
-        # Check if product and bin combination already exists
-        if not self.instance:  # Only for create operations
-            product = data.get('product')
-            bin_obj = data.get('bin')
-            if product and bin_obj:
-                if Inventory.objects.filter(product=product, bin=bin_obj).exists():
-                    raise serializers.ValidationError(
-                        "Inventory record already exists for this product in this bin"
-                    )
-        
+        product = data.get('product')
+        bin_obj = data.get('bin')
+
+        # Prevent duplicate entry
+        if not self.instance and product and bin_obj:
+            if Inventory.objects.filter(product=product, bin=bin_obj).exists():
+                raise serializers.ValidationError(
+                    "Inventory already exists for this product in this bin"
+                )
+
         # Validate bin capacity
-        if 'quantity' in data and 'bin' in data:
-            bin_obj = data['bin']
+        if bin_obj and 'quantity' in data:
             current_quantity = data['quantity']
-            
-            # Get total in bin including this new inventory
+
             other_inventory = Inventory.objects.filter(bin=bin_obj)
             if self.instance:
-                other_inventory = other_inventory.exclude(inventory_id=self.instance.inventory_id)
-            
-            total_in_bin = other_inventory.aggregate(total=sum('quantity'))['total'] or 0
+                other_inventory = other_inventory.exclude(pk=self.instance.pk)
+
+            total_in_bin = other_inventory.aggregate(
+                total=Sum('quantity')
+            )['total'] or 0
+
             total_in_bin += current_quantity
-            
+
             if total_in_bin > bin_obj.capacity:
                 raise serializers.ValidationError({
-                    "quantity": f"Total quantity in bin ({total_in_bin}) would exceed bin capacity ({bin_obj.capacity})"
+                    "quantity": f"Total ({total_in_bin}) exceeds bin capacity ({bin_obj.capacity})"
                 })
-        
-        return data
 
+        return data
 
 # ================= PURCHASE REQUEST SERIALIZER =================
 
@@ -120,7 +134,7 @@ class PurchaseRequestSerializer(serializers.ModelSerializer):
     """Serializer for PurchaseRequest with validation"""
     
     product_name = serializers.CharField(source='product.product_name', read_only=True)
-    vendor_name = serializers.CharField(source='vendor.name', read_only=True)
+    vendor_name = serializers.CharField(source='vendor.vendor_name', read_only=True)
     created_by_username = serializers.CharField(source='created_by.username', read_only=True)
     approved_by_username = serializers.CharField(source='approved_by.username', read_only=True)
     
@@ -173,7 +187,7 @@ class PurchaseOrderSerializer(serializers.ModelSerializer):
     
     pr_id = serializers.CharField(source='pr.pr_id', read_only=True)
     product_name = serializers.CharField(source='pr.product.product_name', read_only=True)
-    vendor_name = serializers.CharField(source='vendor.name', read_only=True)
+    vendor_name = serializers.CharField(source='vendor.vendor_name', read_only=True)
     created_by_username = serializers.CharField(source='created_by.username', read_only=True)
     
     class Meta:
@@ -243,7 +257,7 @@ class ASNSerializer(serializers.ModelSerializer):
     """Serializer for ASN with nested items"""
     
     po_id = serializers.CharField(source='po.po_id', read_only=True)
-    vendor_name = serializers.CharField(source='vendor.name', read_only=True)
+    vendor_name = serializers.CharField(source='vendor.vendor_name', read_only=True)
     items = ASNItemSerializer(many=True, read_only=True)
     created_by_username = serializers.CharField(source='created_by.username', read_only=True)
     
@@ -352,41 +366,62 @@ class GRNItemCreateSerializer(serializers.ModelSerializer):
 
 class GRNItemQCSerializer(serializers.ModelSerializer):
     """
-    Used by QCUpdateGRNItem.
-    - Writable: accepted_quantity, rejected_quantity, qc_notes
+    Used for QC update
     """
-    
+
     class Meta:
         model = GRNItem
         fields = [
-            "grn_item_id", "grn", "product", "received_quantity",
-            "accepted_quantity", "rejected_quantity", "qc_status", "qc_notes"
+            "grn_item_id",
+            "grn",
+            "product",
+            "received_quantity",
+            "accepted_quantity",
+            "rejected_quantity",
+            "qc_status",
+            "qc_notes"
         ]
-        read_only_fields = ["grn_item_id", "grn", "product", "received_quantity"]
-    
+        read_only_fields = [
+            "grn_item_id",
+            "grn",
+            "product",
+            "received_quantity"
+        ]
+
     def validate(self, data):
         accepted = data.get("accepted_quantity", self.instance.accepted_quantity)
         rejected = data.get("rejected_quantity", self.instance.rejected_quantity)
         qc_notes = data.get("qc_notes", self.instance.qc_notes)
         received = self.instance.received_quantity
-        
+
+        # Basic validations
+        if accepted is None or rejected is None:
+            raise serializers.ValidationError(
+                "Accepted and rejected quantities are required"
+            )
+
         if accepted < 0:
-            raise serializers.ValidationError({"accepted_quantity": "Accepted quantity cannot be negative"})
-        
+            raise serializers.ValidationError({
+                "accepted_quantity": "Cannot be negative"
+            })
+
         if rejected < 0:
-            raise serializers.ValidationError({"rejected_quantity": "Rejected quantity cannot be negative"})
-        
+            raise serializers.ValidationError({
+                "rejected_quantity": "Cannot be negative"
+            })
+
+        # Core QC rule
         if accepted + rejected > received:
             raise serializers.ValidationError(
-                f"Accepted + rejected ({accepted + rejected}) exceeds received ({received})."
+                f"Accepted + Rejected ({accepted + rejected}) exceeds received ({received})"
             )
-        
-        # If everything is rejected, maybe require notes
+
+        # Mandatory rejection reason
         if accepted == 0 and rejected > 0 and not qc_notes:
             raise serializers.ValidationError({
-                "qc_notes": "Please provide reason for rejection"
+                "qc_notes": "Reason required when all items are rejected"
             })
-        
+
         return data
 
 
@@ -435,13 +470,14 @@ class GRNReadSerializer(serializers.ModelSerializer):
         ]
     
     def get_total_received(self, obj):
-        return obj.items.aggregate(total=models.Sum('received_quantity'))['total'] or 0
-    
+        return obj.items.aggregate(total=Sum('received_quantity'))['total'] or 0
+
     def get_total_accepted(self, obj):
-        return obj.items.aggregate(total=models.Sum('accepted_quantity'))['total'] or 0
-    
+        return obj.items.aggregate(total=Sum('accepted_quantity'))['total'] or 0
+
     def get_total_rejected(self, obj):
-        return obj.items.aggregate(total=models.Sum('rejected_quantity'))['total'] or 0
+        return obj.items.aggregate(total=Sum('rejected_quantity'))['total'] or 0
+
     
     def get_acceptance_rate(self, obj):
         received = self.get_total_received(obj)
@@ -491,37 +527,30 @@ class InboundTransSerializer(serializers.ModelSerializer):
 
 class OutboundTransSerializer(serializers.ModelSerializer):
     """Serializer for outbound transactions"""
-    
-    created_by_username = serializers.CharField(source='created_by.username', read_only=True)
-    product_name = serializers.SerializerMethodField()
-    
+
+    created_by_username = serializers.CharField(
+        source='created_by.username', read_only=True
+    )
+    product_name = serializers.CharField(
+        source='product.product_name', read_only=True
+    )
+
     class Meta:
         model = outbound_trans
         fields = [
-            'outbound_id', 'product_id', 'product_name', 'quantity',
-            'created_by', 'created_by_username', 'status', 'created_at', 'completed_at'
+            'outbound_id',
+            'product',              # FK (better than raw product_id)
+            'product_name',
+            'quantity',
+            'created_by',
+            'created_by_username',
+            'status',
+            'created_at',
+            'completed_at'
         ]
         read_only_fields = ['outbound_id', 'created_at']
-    
-    def get_product_name(self, obj):
-        try:
-            product = Product.objects.get(product_id=obj.product_id)
-            return product.product_name
-        except Product.DoesNotExist:
-            return None
 
-
-# ================= HELPER FUNCTIONS =================
-
-def validate_unique_together(instance, field1, field2, model):
-    """Helper to validate unique_together constraints"""
-    queryset = model.objects.filter(**{field1: getattr(instance, field1)})
-    queryset = queryset.filter(**{field2: getattr(instance, field2)})
-    
-    if instance.pk:
-        queryset = queryset.exclude(pk=instance.pk)
-    
-    if queryset.exists():
-        raise serializers.ValidationError(
-            f"{field1} and {field2} must be unique together."
-        )
+    def validate_quantity(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Quantity must be greater than 0")
+        return value

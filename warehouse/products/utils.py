@@ -10,32 +10,54 @@ import logging
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+import re
 
 def parse_vendor_invoice(file_obj):
     extracted_items = []
-    
+    vendor_email = None
+    invoice_number = None
+
     try:
         with pdfplumber.open(file_obj) as pdf:
             if len(pdf.pages) == 0:
                 raise ValueError("PDF file is empty")
             
             page = pdf.pages[0]
-            
-            # Try table extraction first
+
+            # ✅ Extract full text (for vendor + invoice info)
+            full_text = page.extract_text() or ""
+            full_text_lower = full_text.lower()
+
+            # ✅ Extract vendor email
+            email_match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', full_text)
+            if email_match:
+                vendor_email = email_match.group(0)
+
+            # ✅ Extract invoice number (basic pattern)
+            invoice_match = re.search(
+                r'(invoice\s*(no|number)?[:\s\-]*)([A-Za-z0-9\-]+)', 
+                full_text_lower
+            )
+            if invoice_match:
+                invoice_number = invoice_match.group(3).upper()
+
+            # =========================
+            # TABLE EXTRACTION
+            # =========================
             tables = page.extract_tables()
-            
+
             if tables:
-                # Original table parsing logic
                 table = tables[0]
+
                 if not table or len(table) < 2:
                     raise ValueError("Table has no data rows")
-                
+
                 headers = table[0]
                 column_mapping = identify_columns(headers)
-                
+
                 if not column_mapping:
                     raise ValueError("Could not identify required columns")
-                
+
                 for row_idx, row in enumerate(table[1:], start=2):
                     try:
                         if not row or all(cell is None or str(cell).strip() == '' for cell in row):
@@ -44,32 +66,51 @@ def parse_vendor_invoice(file_obj):
                         sku = extract_cell_value(row, column_mapping.get('sku'))
                         qty = extract_cell_value(row, column_mapping.get('qty'))
                         price = extract_cell_value(row, column_mapping.get('price'))
-                        
+
                         if not sku or qty is None or price is None:
                             continue
                         
                         extracted_items.append({
                             "sku": str(sku).strip(),
+                            "product_name": "",  # optional if not available
                             "quantity": int(qty),
-                            "price": float(str(price).replace('$', '').replace(',', '').strip())
+                            "price": float(str(price).replace('$', '').replace(',', '').strip()),
+                            "invoice_number": invoice_number
                         })
+
                     except (ValueError, IndexError, TypeError) as e:
                         logger.warning(f"Row {row_idx}: Failed to parse - {str(e)}")
                         continue
 
             else:
-                # Fallback: parse raw text line by line
-                logger.info("No tables found, attempting text-based parsing")
-                extracted_items = parse_invoice_from_text(page)
-            
+                # =========================
+                # TEXT-BASED FALLBACK
+                # =========================
+                logger.info("No tables found, attempting text parsing")
+
+                text_items = parse_invoice_from_text(page)
+
+                # attach invoice number to each item
+                for item in text_items:
+                    item["invoice_number"] = invoice_number
+
+                extracted_items = text_items
+
             if not extracted_items:
                 raise ValueError("No valid items extracted from invoice")
-                
+
     except Exception as e:
         logger.error(f"PDF parsing failed: {str(e)}", exc_info=True)
         raise ValueError(f"Failed to parse invoice: {str(e)}")
-    
-    return extracted_items
+
+    # =========================
+    # FINAL STRUCTURED RESPONSE
+    # =========================
+    return {
+        "vendor_email": vendor_email,
+        "invoice_number": invoice_number,
+        "items": extracted_items
+    }
 
 def parse_invoice_from_text(page):
     """

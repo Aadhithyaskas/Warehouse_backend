@@ -35,6 +35,11 @@ class Rack(models.Model):
     rack_id = models.CharField(primary_key=True, max_length=10, editable=False)
     zone = models.ForeignKey(Zone, on_delete=models.CASCADE, related_name="racks")
     created_at = models.DateTimeField(auto_now_add=True)
+   
+    
+    class Meta:
+        unique_together = ['zone', 'rack_id']
+
     
     def save(self, *args, **kwargs):
         if not self.rack_id:
@@ -52,6 +57,9 @@ class Shelf(models.Model):
     shelf_id = models.CharField(primary_key=True, max_length=10, editable=False)
     rack = models.ForeignKey(Rack, on_delete=models.CASCADE, related_name="shelves")
     created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ['rack', 'shelf_id']
     
     def save(self, *args, **kwargs):
         if not self.shelf_id:
@@ -81,11 +89,17 @@ class Bin(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
-        indexes = [
-            models.Index(fields=['current_load', 'capacity']),
-            models.Index(fields=['distance_from_dispatch']),
-            models.Index(fields=['pick_count']),
+        constraints = [
+            models.CheckConstraint(
+                check=models.Q(current_load__gte=0),
+                name="current_load_non_negative"
+            ),
+            models.CheckConstraint(
+                check=models.Q(current_load__lte=models.F('capacity')),
+                name="load_not_exceed_capacity"
+            ),
         ]
+
     
     def save(self, *args, **kwargs):
         # Validate capacity
@@ -114,46 +128,29 @@ class Bin(models.Model):
     def __str__(self):
         return f"{self.bin_id} (Load: {self.current_load}/{self.capacity})"
 
-
 class Inventory(models.Model):
     inventory_id = models.CharField(max_length=10, primary_key=True, editable=False)
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="inventory_items")
-    bin = models.ForeignKey(Bin, on_delete=models.CASCADE, related_name="inventory_items")
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    bin = models.ForeignKey(Bin, on_delete=models.CASCADE)
+
     quantity = models.IntegerField(default=0)
-    
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    
+
     class Meta:
-        unique_together = ['product', 'bin']  # Prevent duplicate entries for same product/bin
-        indexes = [
-            models.Index(fields=['product', 'quantity']),
-            models.Index(fields=['bin', 'quantity']),
-        ]
-    
+        unique_together = ['product', 'bin']
+
     def save(self, *args, **kwargs):
         if self.quantity < 0:
-            raise ValidationError({"quantity": "Quantity cannot be negative"})
-        
-        if not self.inventory_id:
-            with transaction.atomic():
-                last = Inventory.objects.select_for_update().order_by('-created_at').last()
-                new_id = (int(last.inventory_id[3:]) + 1) if last else 1
-                self.inventory_id = f"INV{new_id:04d}"
-        
+            raise ValidationError("Quantity cannot be negative")
+
         super().save(*args, **kwargs)
-        
-        # Update bin current load after inventory change
-        if self.bin:
-            total_in_bin = Inventory.objects.filter(bin=self.bin).aggregate(
-                total=models.Sum('quantity')
-            )['total'] or 0
-            if self.bin.current_load != total_in_bin:
-                self.bin.current_load = total_in_bin
-                self.bin.save(update_fields=['current_load'])
-    
-    def __str__(self):
-        return f"{self.product.product_name} - {self.bin.bin_id} (Qty: {self.quantity})"
+
+        # Sync bin load
+        total = Inventory.objects.filter(bin=self.bin).aggregate(
+            total=models.Sum("quantity")
+        )['total'] or 0
+
+        self.bin.current_load = total
+        self.bin.save(update_fields=["current_load"])
 
 
 class PurchaseRequest(models.Model):
@@ -185,7 +182,11 @@ class PurchaseRequest(models.Model):
     
     def clean(self):
         if self.requested_quantity <= 0:
-            raise ValidationError({"requested_quantity": "Quantity must be greater than 0"})
+            raise ValidationError("Quantity must be greater than 0")
+
+        if self.product.vendor != self.vendor:
+            raise ValidationError("Vendor must match product vendor")
+
     
     def save(self, *args, **kwargs):
         self.clean()
@@ -242,6 +243,14 @@ class PurchaseOrder(models.Model):
     def __str__(self):
         return f"{self.po_id} - {self.vendor.name} ({self.status})"
 
+    def clean(self):
+    if self.order_quantity <= 0:
+        raise ValidationError("Order quantity must be greater than 0")
+
+    if self.pr.vendor != self.vendor:
+        raise ValidationError("Vendor mismatch with PR")
+
+
 
 class StockMovement(models.Model):
     MOVEMENT_TYPES = [
@@ -279,6 +288,16 @@ class StockMovement(models.Model):
                 self.movement_id = f"SM{new_id:04d}"
         super().save(*args, **kwargs)
     
+    def clean(self):
+        if self.quantity <= 0:
+            raise ValidationError("Quantity must be greater than 0")
+
+        if self.new_stock < 0:
+            raise ValidationError("Stock cannot go negative")
+    class Meta:
+        ordering = ['-created_at']
+
+
     def __str__(self):
         return f"{self.movement_id} - {self.product.product_name} ({self.movement_type})"
 
@@ -324,6 +343,11 @@ class ASN(models.Model):
     def __str__(self):
         return f"{self.asn_id} - {self.asn_number}"
 
+    def clean(self):
+        if self.expected_arrival_date < self.shipment_date:
+            raise ValidationError("Arrival date cannot be before shipment date")
+
+
 
 class ASNItem(models.Model):
     asn_item_id = models.CharField(max_length=20, primary_key=True, editable=False)
@@ -352,6 +376,14 @@ class ASNItem(models.Model):
                 new_id = (int(last.asn_item_id.split('-')[-1]) + 1) if last else 1
                 self.asn_item_id = f"ASN-ITM-{new_id:03d}"
         super().save(*args, **kwargs)
+
+    def clean(self):
+        if self.expected_quantity <= 0:
+            raise ValidationError("Expected quantity must be > 0")
+
+        if self.shipped_quantity < 0 or self.received_quantity < 0:
+            raise ValidationError("Quantities cannot be negative")
+
     
     def __str__(self):
         return f"{self.asn_item_id} - {self.product.product_name}"
@@ -394,6 +426,11 @@ class GRN(models.Model):
                 new_id = (int(last.grn_id.split('-')[-1]) + 1) if last else 1
                 self.grn_id = f"GRN-{new_id:04d}"
         super().save(*args, **kwargs)
+
+    def clean(self):
+        if self.asn and self.asn.po != self.po:
+            raise ValidationError("ASN must belong to same PO")
+
     
     def __str__(self):
         return f"{self.grn_id} - {self.po.po_id} ({self.status})"
@@ -462,7 +499,7 @@ class inbound_trans(models.Model):
     ]
     
     inbound_id = models.CharField(max_length=10, primary_key=True, editable=False)
-    po_id = models.CharField(max_length=10)  # Reference to PO
+    po = models.ForeignKey(PurchaseOrder, on_delete=models.CASCADE)
     received_by = models.ForeignKey("auth.User", on_delete=models.SET_NULL, null=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="CREATED")
     created_at = models.DateTimeField(auto_now_add=True)
@@ -488,7 +525,7 @@ class outbound_trans(models.Model):
     ]
     
     outbound_id = models.CharField(max_length=10, primary_key=True, editable=False)
-    product_id = models.CharField(max_length=10)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
     quantity = models.IntegerField()
     created_by = models.ForeignKey("auth.User", on_delete=models.SET_NULL, null=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="CREATED")

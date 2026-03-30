@@ -4,21 +4,22 @@ from .models import Product
 from vendors.models import Vendor
 from supplier.models import Supplier
 
-
 class ProductSerializer(serializers.ModelSerializer):
-    # Read-only fields for display
+    """Serializer for Product model"""
+
+    # Read-only display fields
     vendor_details = serializers.SerializerMethodField(read_only=True)
     supplier_details = serializers.SerializerMethodField(read_only=True)
-    
-    # Write-only fields for IDs
+
+    # Write-only IDs
     vendor_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
     supplier_id = serializers.IntegerField(write_only=True, required=False, allow_null=True)
-    
-    # Display fields
+
+    # Classification display
     abc_display = serializers.CharField(source='get_ABC_display', read_only=True)
     ved_display = serializers.CharField(source='get_VED_display', read_only=True)
     xyz_display = serializers.CharField(source='get_XYZ_display', read_only=True)
-    
+
     class Meta:
         model = Product
         fields = [
@@ -58,7 +59,9 @@ class ProductSerializer(serializers.ModelSerializer):
             'vendor_details',
             'supplier_details'
         ]
-    
+
+    # ---------- Display Helpers ----------
+
     def get_vendor_details(self, obj):
         if obj.vendor:
             return {
@@ -66,7 +69,7 @@ class ProductSerializer(serializers.ModelSerializer):
                 "name": obj.vendor.vendor_name
             }
         return None
-    
+
     def get_supplier_details(self, obj):
         if obj.supplier:
             return {
@@ -74,17 +77,19 @@ class ProductSerializer(serializers.ModelSerializer):
                 "name": obj.supplier.supplier_name
             }
         return None
-    
+
+    # ---------- Validations ----------
+
     def validate_product_name(self, value):
-        if not value or len(value.strip()) == 0:
+        if not value or not value.strip():
             raise serializers.ValidationError("Product name is required")
         return value.strip()
-    
+
     def validate_unit_price(self, value):
         if value <= 0:
             raise serializers.ValidationError("Unit price must be greater than 0")
         return value
-    
+
     def validate(self, data):
         # Handle vendor_id
         vendor_id = data.pop('vendor_id', None)
@@ -93,7 +98,7 @@ class ProductSerializer(serializers.ModelSerializer):
                 data['vendor'] = Vendor.objects.get(vendor_id=vendor_id)
             except Vendor.DoesNotExist:
                 raise serializers.ValidationError({'vendor_id': 'Vendor not found'})
-        
+
         # Handle supplier_id
         supplier_id = data.pop('supplier_id', None)
         if supplier_id is not None:
@@ -101,6 +106,5 @@ class ProductSerializer(serializers.ModelSerializer):
                 data['supplier'] = Supplier.objects.get(supplier_id=supplier_id)
             except Supplier.DoesNotExist:
                 raise serializers.ValidationError({'supplier_id': 'Supplier not found'})
-        
-        return data
 
+        return data
